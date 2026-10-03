@@ -2,6 +2,7 @@ import configparser
 import sys
 import apis.apicorreios as correios
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import trackingmore
 from pymongo import MongoClient
@@ -18,7 +19,7 @@ key = config['TRACKINGMORE']['key']
 trackingmore.set_api_key(key)
 
 
-def sort_carriers(carriers):
+def sort_carriers(carriers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     priorities = ["cainiao"]
     priorities.reverse()
 
@@ -29,6 +30,42 @@ def sort_carriers(carriers):
             return -1
 
     return sorted(carriers, key=get_index, reverse=True)
+
+
+def _normalize_carrier_mapping(carrier: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(carrier, dict):
+        return None
+
+    code = carrier.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return None
+
+    normalized = carrier.copy()
+    normalized["code"] = code.strip()
+    return normalized
+
+
+def _normalize_cached_carriers(
+    value: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    if isinstance(value, str):
+        code = value.strip()
+        return [{"code": code}] if code else None
+
+    if isinstance(value, dict):
+        carrier = _normalize_carrier_mapping(value)
+        return [carrier] if carrier else None
+
+    if isinstance(value, list) and value:
+        carriers = []
+        for carrier in value:
+            normalized = _normalize_carrier_mapping(carrier)
+            if normalized is None:
+                return None
+            carriers.append(normalized)
+        return carriers
+
+    return None
 
 
 def get_or_create_tracking_item(carrier, code):
@@ -45,21 +82,41 @@ def get_or_create_tracking_item(carrier, code):
 
     return tracking_data
 
-def get_carriers(code):
-    cursor = db.search_package(code)
-    try:
-        if type(cursor['carrier']) is dict:
-            return [cursor['carrier']]
-        return cursor['carrier']
-    except:
-        try:
-            carriers = trackingmore.detect_carrier_from_code(code)
-        except Exception as e:
-            print(e)
-            raise IndexError
+def get_carriers(code: str) -> List[Dict[str, Any]]:
+    """Return a list of valid carrier mappings for downstream consumers.
 
-        carriers = sort_carriers(carriers)
-        db.update_package(code, carrier=carriers)
+    Commit 36150d0 documents historical string/list carrier values, but no
+    production payload was available to confirm their exact shape. A non-empty
+    cached string is therefore treated as a carrier code for compatibility;
+    missing, empty, or malformed cached values use TrackingMore detection.
+    Detection results that are not a list of mappings with non-empty string
+    codes safely produce an empty list rather than leaking malformed values.
+    """
+    package = db.search_package(code)
+    cached_value = package.get("carrier") if isinstance(package, dict) else None
+    carriers = _normalize_cached_carriers(cached_value)
+    if carriers is not None:
+        return carriers
+
+    try:
+        detected = trackingmore.detect_carrier_from_code(code)
+    except Exception as e:
+        print(e)
+        raise IndexError
+
+    if isinstance(detected, list):
+        carriers = []
+        for carrier in detected:
+            normalized = _normalize_carrier_mapping(carrier)
+            if normalized is None:
+                carriers = []
+                break
+            carriers.append(normalized)
+    else:
+        carriers = []
+
+    carriers = sort_carriers(carriers)
+    db.update_package(code, carrier=carriers)
     return carriers
 
 def get(code, retries=0):
